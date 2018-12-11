@@ -1,3 +1,4 @@
+WHITESPACE = _{ " " }
 file = { SOI ~ ( item ~ "\n"*  )* ~ EOI }
 
 item = {
@@ -19,27 +20,47 @@ source_filename = { "source_filename = " ~ (!"\n" ~ ANY)+ }
 target_datalayout = { "target datalayout = " ~ (!"\n" ~ ANY)+ }
 target_triple = { "target triple = " ~ (!"\n" ~ ANY)+ }
 
-keyword = { (ASCII_ALPHA | "_")+ }
+keyword = @{ (ASCII_ALPHA | "_")+ }
 
 type_alias = { "%" ~ (!"=" ~ ANY)+ ~ "=" ~ (!"\n" ~ ANY)+ }
 
-global = { "@" ~ (!"=" ~ ANY)+ ~ "= " ~ (!"global" ~ keyword ~ " ")* ~ "global" ~ (!"\n" ~ ANY)+ }
-constant = { "@" ~ (!"=" ~ ANY)+ ~ "= " ~ (!"constant" ~ keyword ~ " ")+ ~ "constant" ~ (!"\n" ~ ANY)+ }
+// FIXME constants can also appear
+ident = { id_named | id_unnamed }
+// The actual regular expression used is '[%@][-a-zA-Z$._][-a-zA-Z$._0-9]*'
+id_named = @{
+  ("-" | "$" | "." | "_" | ASCII_ALPHA) ~
+  ("-" | "$" | "." | "_" | ASCII_ALPHANUMERIC )*
+}
+id_unnamed = @{ ASCII_DIGIT+ }
+
+id_global = @{ "@" ~ ident }
+id_local = @{ "%" ~ ident }
+
+global = { "@" ~ (!"=" ~ ANY)+ ~ "=" ~ (!"global" ~ keyword)* ~ "global" ~ (!"\n" ~ ANY)+ }
+constant = { "@" ~ (!"=" ~ ANY)+ ~ "=" ~ (!"constant" ~ keyword)+ ~ "constant" ~ (!"\n" ~ ANY)+ }
 
 attributes = { "attributes #" ~ (!"\n" ~ ANY)+ }
+id_attribute = @{ "#" ~ ASCII_DIGIT+ }
 
 bang_llvm = { "!llvm." ~ (!"\n" ~ ANY)+ }
 
 metadata_alias = { metadata_alias_string | metadata_alias_wildcard }
 
 // we are only interested in this case (e.g. `!337 = !{!"const Trait::m"}`)
-metadata_alias_string = { metadata_number ~ " = !{!" ~ string ~ "}" }
-metadata_alias_wildcard = { "!" ~ (ASCII_DIGIT)+ ~ " = " ~ (!"\n" ~ ANY)+ }
+metadata_alias_string = { metadata_number ~ "=" ~ "!{!" ~ string ~ "}" }
+metadata_alias_wildcard = { metadata_number ~ "=" ~ (!"\n" ~ ANY)+ }
 
-symbol = { "@" ~ ( (ASCII_ALPHANUMERIC | "_" | ".")+ | ( "\"" ~ (!"\"" ~ ANY)+ ~ "\"" ) ) }
-metadata = { metadata_identifier ~ " " ~ metadata_number }
-metadata_identifier = { "!" ~ ASCII_ALPHA+ }
+symbol = @{ "@" ~ ( (ASCII_ALPHANUMERIC | "_" | ".")+ | ( "\"" ~ (!"\"" ~ ANY)+ ~ "\"" ) ) }
+metadata = { metadata_identifier ~ metadata_number }
+metadata_identifier = @{ "!" ~ id_named }
 metadata_number = { "!" ~ ASCII_DIGIT+ }
+// specialized metadata node, e.g. DIExpression(...)
+metadata_node = @{ "!" ~ ASCII_ALPHA+ ~ skip_paren }
+
+// comma separated metadata is used for instruction
+metadata_list_comma = { ("," ~ metadata)* }
+// definitions don't use comma to separate their metadata
+metadata_list_whitespace = { metadata* }
 
 declare = {
   "declare" ~
@@ -52,54 +73,135 @@ define = {
   "define" ~
   (!"@" ~ ANY)+ ~ // e.g. "void"
   symbol ~ // e.g. "@_ZblahblahE"
-  "(" ~ (!")" ~ ANY)* ~ ")" ~ // e.g. "({ [0 x i32])" - FIXME: this doesn't properly handle nested parentheses
-  (!"{" ~ ANY)+ ~ // e.g. "#0" (attribute)
+  skip_paren ~ // e.g. "({ [0 x i32])"
+  (!("{" | "!") ~ ANY)+ ~ // e.g. "#0" (attribute)
+  metadata_list_whitespace ~
   "{\n" ~
     ((label | instruction | comment) ~ "\n"+)+ ~
   "}"
 }
 
-label = {
+label = @{
   (
     ( "\"" ~ (!"\"" ~ ANY)+ ~ "\"" ) |
     (ASCII_ALPHANUMERIC | "." | "_")+
   ) ~ ":" ~
   (" "+ ~ comment)?
 }
-instruction = { "  " ~ (insn_assign | maybe_call) }
+instruction = { (assign | maybe_call) ~ metadata_list_comma }
 
-insn_assign = { "%" ~ (!"=" ~ ANY)+ ~ "= " ~ maybe_call }
+not_call = { insn_not_call ~ (!"\n" ~ ANY)* }
+insn_not_call = {
+  insn_terminator | insn_unary | insn_binary | insn_binary_bitwise | insn_memory
+  | insn_other
+}
+insn_terminator = {
+  "ret" | "br" | "switch" | "indirectbr" | "invoke" | "resume" | "catchswitch"
+  | "catchret" | "cleanupret" | "unreachable"
+}
+insn_unary = { "fneg" }
+insn_binary = {
+  "add" | "fadd" | "sub" | "fsub" | "mul" | "fmul" | "udiv" | "sdiv" | "fdiv"
+  | "urem" | "srem" | "frem"
+}
+insn_binary_bitwise = {
+  "shl" | "lshr" | "ashr" | "and" | "or" | "xor"
+}
+insn_memory = {
+  "extractelement" | "insertelement" | "shufflevector" | "extractvalue" |
+  "insertvalue" | "alloca" | "load" | "store" | "fence" | "cmpxchg" |
+  "atomicrmw" | "getelementptr" | "trunc" | "zext" | "sext" | "fptrunc" |
+  "fpext" | "fptoui" | "fptosi" | "uitofp" | "sitofp" | "ptrtoint" |
+  "inttoptr" | "bitcast" | "addrspacecast"
+}
+// call is handled separately
+insn_other = {
+  "icmp" | "fcmp" | "phi" | "select" | "va_arg" | "catchpad" | "cleanuppad"
+}
+
+assign = { "%" ~ (!"=" ~ ANY)+ ~ "= " ~ maybe_call }
 
 wildcard = { (!"\n" ~ ANY)+ }
-maybe_call = { call_asm | call_direct | call_indirect | wildcard }
+maybe_call = { call | not_call }
 
 string = { "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 
-call_asm = {
-  (!"call" ~ ASCII_ALPHA+ ~ " ")* ~ // e.g. "tail"
-  "call" ~ " " ~
-  (!"asm" ~ ASCII_ALPHANUMERIC+ ~ " ")+ ~ // e.g. "void" or "i32"
-  "asm" ~
-  (!"\"" ~ ANY)+ ~ // e.g. "sideeffect"
-  string ~
-  (!"\n" ~ ANY)+
+any_tail = { "tail" | "musttail" | "notail" }
+ty = {
+  ("void" | ty_int | ty_float | ty_mmx | ty_vec | ty_label | ty_metadata) ~
+  ty_tail
+}
+ty_tail = { (ty_ptr_tail | ty_fn_tail)? }
+
+ty_fn_tail = { "(" ~ tlist ~ ")"}
+ty_ptr_tail = { "*" }
+
+tlist = { (ty ~ ("," ~ ty)*)? } // zero or more comma separated types
+
+// first class types
+ty_int = @{ "i" ~ ASCII_DIGIT+ }
+ty_float = { "half" | "float" | "double" | "fp128" | "x86_fp80" | "ppc_fp128" }
+ty_mmx = { "x86_mmx" }
+ty_vec = { "<" ~ ASCII_DIGIT+ ~ "x" ~ ty ~ ">" }
+ty_label = { "label" }
+ty_metadata = { "metadata" ~ (metadata_number | metadata_node) }
+
+ty_array = { "[" ~ ASCII_DIGIT+ ~ "x" ~ ty ~ "]" }
+ty_struct = { "{" ~ tlist ~ "}" }
+ty_opaque = { "opaque" }
+
+fast_math_flags = { fast_math_flag* }
+fast_math_flag = {
+  // the "fast" flag requires a space at the end so it is not a prefix of the
+  // "fastcc" calling convention
+  "nnan" | "ninf" | "nsz" | "arcp" | "contract" | "afn" | "reassoc" | "fast "
 }
 
-call_direct = {
-  (!"call" ~ ASCII_ALPHA+ ~ " ")* ~ // e.g. "tail"
-  "call" ~ " " ~
-  (ASCII_ALPHANUMERIC+ ~ " ")+ ~ // e.g. "void" or "i1"
-  symbol ~ // e.g. "@_ZblahblahE"
-  (!"\n" ~ ANY)+
+// calling convention
+cconv = {
+  "ccc" | "fastcc" | "coldcc" | "webkit_jscc" | "anyregcc" | "preserve_mostcc"
+  | "preserve_allcc" | "cxx_fast_tlscc" | "swiftcc" | "cc" ~ ASCII_DIGIT+
 }
 
+// subset of parameter attributes that can appear in calls
+ret_attr = { "zeroext" | "signext" | "inreg" }
+ret_attrs = { id_attribute | ret_attr* }
+
+addrspace = { "addrspace(" ~ ASCII_DIGIT+ ~ ")" }
+
+fn_args = { skip_paren }
+
+// skip to end of instruction
+// (possibly followed by attatched metadata on the same line)
+fn_attrs_op_bundles = {
+  (skip_paren | !"\n" ~ !"," ~ ANY)*
+}
+
+// skip contents
+skip_paren = { "(" ~ (skip_paren | !")" ~ ANY)* ~ ")" }
+
+call = _{ call_indirect | call_direct }
+
+// callee is a local id
 call_indirect = {
-  (!"call" ~ ASCII_ALPHA+ ~ " ")* ~ // e.g. "tail"
-  "call" ~ " " ~
-  (!"%" ~ ANY)+ ~ // e.g. "void" or "i32
-  "%" ~ (!")"  ~ ANY)+ ~ ")" ~ // e.g. "%3({}* nonnull %0, i32 42)"
-  (!"\n" ~ !"!" ~ ANY)+ ~ // e.g. "#0"
-  (metadata ~ ", "?)*
+  any_tail? ~ "call" ~ fast_math_flags ~ cconv? ~ ret_attrs? ~ addrspace? ~
+  ty ~ id_local ~ fn_args ~ fn_attrs_op_bundles
 }
+
+// callee is a global id
+call_direct = {
+  any_tail? ~ "call" ~ fast_math_flags ~ cconv? ~ ret_attrs? ~ addrspace? ~
+  ty ~ id_global ~ fn_args ~ fn_attrs_op_bundles
+}
+
+call_asm = {
+  any_tail? ~ "call" ~ fast_math_flags ~ cconv? ~ ret_attrs? ~ addrspace? ~
+  ty ~ asm_expr ~ fn_args ~ fn_attrs_op_bundles
+}
+
+asm_expr = {
+  "asm" ~ asm_keywords ~ string ~ "," ~ string
+}
+asm_keywords = { "sideeffect"? ~ "alignstack"? ~ "inteldialect"? }
 
 comment = { ";" ~ (!"\n" ~ ANY)+ }

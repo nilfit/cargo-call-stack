@@ -301,13 +301,28 @@ fn run() -> Result<i32, failure::Error> {
 
                     g.add_edge(caller, callee, ());
                 }
-                Call::Fn => {
+                Call::Fn { sig }=> {
                     // create a fictitious node for each indirect call
-                    let external = g.add_node(Node("_: fn(..) -> _", None));
+                    let external = g.add_node(Node(sig, Some(0)));
+                    // NOTE This node can (should?) be shared as long as the
+                    // signature matches
+
+                    // look for functions that match the signature
+                    for def in &defines {
+                        if def.sig() == sig {
+                            let callee = if let Some(canonical_name) = aliases.get(&def.name()) {
+                                indices[*canonical_name]
+                            } else {
+                                // this symbol was GC-ed by the linker, skip
+                                continue;
+                            };
+                            g.add_edge(external, callee, ());
+                        }
+                    }
 
                     g.add_edge(caller, external, ());
                 }
-                Call::Trait { name, method } => {
+                Call::Trait { name, method, .. } => {
                     // create a fictitious node for each trait object dispatch
                     let to = format!("dyn {}::{}", name, method);
 

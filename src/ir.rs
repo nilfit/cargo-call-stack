@@ -12,17 +12,18 @@ struct Ir;
 pub fn parse(ll: &str) -> Result<Vec<Define>, failure::Error> {
     let file = Ir::parse(Rule::file, ll)?.next().expect("unreachable");
 
-    // first pass: look for !rust metadata which has the form `!42 = !{!"const Trait::method"}`
+    // first pass: look for !rust_name metadata which has the form `!42 = !{!"const Trait::method"}`
+    // and !rust_sig which has the form `!42 = !{!"fn(type) -> type"}`
+    let mut metadata_names = HashMap::new();
     let mut metadata = HashMap::new();
     for item in file
         .clone()
         .into_inner()
         // skip SOI / EOI
         .filter(|p| p.as_rule() == Rule::item)
+        .map(|p| p.into_inner().next().expect("unreachable"))
+        .filter(|p| p.as_rule() == Rule::metadata_alias)
     {
-        let item = item.into_inner().next().expect("unreachable");
-
-        if item.as_rule() == Rule::metadata_alias {
             let alias = item.into_inner().next().expect("unreachable");
 
             if alias.as_rule() == Rule::metadata_alias_string {
@@ -45,10 +46,16 @@ pub fn parse(ll: &str) -> Result<Vec<Define>, failure::Error> {
 
                     let number = number[1..].parse::<u64>().expect("unreachable");
 
-                    metadata.insert(number, &string["\"const ".len()..string.len() - 1]);
+                    metadata_names.insert(number, &string["\"const ".len()..string.len() - 1]);
+                } else {
+                    let number = first.as_str();
+                    debug_assert!(number.starts_with("!"));
+
+                    let number = number[1..].parse::<u64>().expect("unreachable");
+
+                    metadata.insert(number, &string[1..string.len() - 1]);
                 }
             }
-        }
     }
 
     // second pass: parse all the `define` items
@@ -57,34 +64,58 @@ pub fn parse(ll: &str) -> Result<Vec<Define>, failure::Error> {
         .into_inner()
         // skip SOI / EOI
         .filter(|p| p.as_rule() == Rule::item)
+        .map(|p| p.into_inner().next().expect("unreachable"))
+        .filter(|p| p.as_rule() == Rule::define)
     {
-        let item = item.into_inner().next().expect("unreachable");
-
-        if item.as_rule() == Rule::define {
+        let item_span = item.as_span();
             let mut name = None;
+            let mut sig = None;
             let mut calls = vec![];
             for pair in item.into_inner() {
                 match pair.as_rule() {
+                    Rule::metadata_list_whitespace => {
+                        for md in pair.into_inner() {
+                            debug_assert!(md.as_rule() == Rule::metadata);
+                            let mut pairs = md.into_inner();
+                            let md_ident = pairs.next().expect("unreachable");
+                            if md_ident.as_str() == "!rust_sig" {
+                                let md_number = pairs.next().expect("unreachable");
+                                debug_assert_eq!(md_number.as_rule(), Rule::metadata_number);
+
+                                let idx = md_number.as_str()[1..]
+                                    .parse::<u64>()
+                                    .expect("unreachable");
+
+                                sig = metadata.get(&idx).cloned().map(String::from);
+                            }
+                        }
+                    }
                     Rule::symbol => {
                         assert!(name.is_none());
 
                         name = Some(symbol_to_string(pair.as_str()));
                     }
                     Rule::instruction => {
-                        // Rule = insn_assign | maybe_call
-                        let mut pair = pair.into_inner().next().unwrap();
+                        // Rule = (assign | maybe_call) ~ metadata_list
+                        let mut pairs = pair.into_inner();
+                        // assign | maybe_call
+                        let mut first = pairs.next().unwrap();
+                        let meta_list_opt = pairs.next();
 
                         // Rule = maybe_call
-                        if pair.as_rule() == Rule::insn_assign {
-                            pair = pair.into_inner().next().unwrap();
+                        if first.as_rule() == Rule::assign {
+                            first = first.into_inner().next().unwrap();
                         }
 
-                        // Rule = call_asm | call_direct | call_indirect | wildcard
-                        pair = pair.into_inner().next().unwrap();
-
+                        // Rule = call_asm | call_direct | call_indirect | not_call
+                        let pair = first.into_inner().next().unwrap();
                         match pair.as_rule() {
                             Rule::call_asm => {
                                 let expr = pair
+                                    .into_inner()
+                                    .filter(|p| p.as_rule() == Rule::asm_expr)
+                                    .next()
+                                    .expect("unreachable")
                                     .into_inner()
                                     .filter(|p| p.as_rule() == Rule::string)
                                     .next()
@@ -101,7 +132,7 @@ pub fn parse(ll: &str) -> Result<Vec<Define>, failure::Error> {
                             Rule::call_direct => {
                                 let symbol = pair
                                     .into_inner()
-                                    .filter(|p| p.as_rule() == Rule::symbol)
+                                    .filter(|p| p.as_rule() == Rule::id_global)
                                     .next()
                                     .expect("unreachable")
                                     .as_str();
@@ -120,7 +151,11 @@ pub fn parse(ll: &str) -> Result<Vec<Define>, failure::Error> {
                             }
                             Rule::call_indirect => {
                                 let mut path = None;
-                                for pair in pair.into_inner() {
+                                let mut sig = None;
+
+                                let span = pair.as_span();
+
+                                for pair in meta_list_opt.unwrap().into_inner() {
                                     debug_assert_eq!(pair.as_rule(), Rule::metadata);
 
                                     let mut pairs = pair.into_inner();
@@ -128,20 +163,35 @@ pub fn parse(ll: &str) -> Result<Vec<Define>, failure::Error> {
                                     let first = pairs.next().expect("unreachable");
                                     debug_assert_eq!(first.as_rule(), Rule::metadata_identifier);
 
-                                    if first.as_str() == "!rust" {
-                                        let second = pairs.next().expect("unreachable");
-                                        debug_assert_eq!(second.as_rule(), Rule::metadata_number);
+                                    match first.as_str() {
+                                        "!rust_name" => {
+                                            let second = pairs.next().expect("unreachable");
+                                            debug_assert_eq!(second.as_rule(), Rule::metadata_number);
 
-                                        let idx = second.as_str()[1..]
-                                            .parse::<u64>()
-                                            .expect("unreachable");
+                                            let idx = second.as_str()[1..]
+                                                .parse::<u64>()
+                                                .expect("unreachable");
 
-                                        // NOTE `None` means that this is a function pointer
-                                        path = metadata.get(&idx).cloned();
+                                            // NOTE `None` means that this is a function pointer
+                                            path = metadata_names.get(&idx).cloned();
+                                        }
+                                        "!rust_sig" => {
+                                            let second = pairs.next().expect("unreachable");
+                                            debug_assert_eq!(second.as_rule(), Rule::metadata_number);
 
-                                        break;
+                                            let idx = second.as_str()[1..]
+                                                .parse::<u64>()
+                                                .expect("unreachable");
+
+                                            // This should be present for all calls
+                                            sig = metadata.get(&idx).cloned();
+                                        }
+                                        _ => {}
                                     }
                                 }
+
+                                let er = format!("missing sig metadata for indirect call: {:?}", span);
+                                let sig = String::from(sig.expect(&er));
 
                                 if let Some(path) = path {
                                     let mut parts = path.rsplitn(2, "::");
@@ -149,12 +199,12 @@ pub fn parse(ll: &str) -> Result<Vec<Define>, failure::Error> {
                                     let method = parts.next().expect("unreachable").to_owned();
                                     let name = parts.next().expect("unreachable").to_owned();
 
-                                    calls.push(Call::Trait { name, method });
+                                    calls.push(Call::Trait { name, method, sig});
                                 } else {
-                                    calls.push(Call::Fn);
+                                    calls.push(Call::Fn { sig });
                                 }
                             }
-                            Rule::wildcard => {
+                            Rule::not_call => {
                                 // Not a function call
                             }
                             _ => unreachable!(),
@@ -164,11 +214,12 @@ pub fn parse(ll: &str) -> Result<Vec<Define>, failure::Error> {
                 }
             }
 
+            let er = format!("missing sig in define: {:?}", item_span);
             defines.push(Define {
                 name: name.unwrap(),
                 calls,
+                sig: sig.expect(&er),
             })
-        }
     }
 
     Ok(defines)
@@ -178,6 +229,7 @@ pub fn parse(ll: &str) -> Result<Vec<Define>, failure::Error> {
 pub struct Define {
     name: String,
     calls: Vec<Call>,
+    sig: String,
 }
 
 impl Define {
@@ -188,6 +240,10 @@ impl Define {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    pub fn sig(&self) -> &str {
+        &self.sig
+    }
 }
 
 #[derive(Debug)]
@@ -196,8 +252,8 @@ pub enum Call {
     Asm { expr: String },
     Direct { callee: String },
     // function pointer
-    Fn,
-    Trait { name: String, method: String },
+    Fn { sig: String },
+    Trait { name: String, method: String, sig: String },
 }
 
 fn symbol_to_string(mut symbol: &str) -> String {
@@ -230,8 +286,10 @@ mod tests {
         )
         .unwrap();
 
+        let asm_expr = pairs.next().unwrap().into_inner().filter(|p| p.as_rule() == Rule::asm_expr)
+            .next().unwrap();
         assert_eq!(
-            pairs.next().unwrap().into_inner().next().unwrap().as_str(),
+            asm_expr.into_inner().skip(1).next().unwrap().as_str(),
             "\"BKPT 1\""
         );
         Ir::parse(
@@ -265,13 +323,16 @@ mod tests {
         .unwrap();
 
         let mut top_pairs = Ir::parse(
-            Rule::call_indirect,
+            Rule::instruction,
             r#"tail call i32 %0() #0, !dbg !323, !rust !324"#,
         )
         .unwrap();
 
         let mut pairs = top_pairs.next().unwrap().into_inner();
-        let first = pairs.next().unwrap();
+        let _ = pairs.next().unwrap();
+        let mut meta_list = pairs.next().unwrap().into_inner();
+
+        let first = meta_list.next().unwrap();
         assert_eq!(first.as_rule(), Rule::metadata);
         assert_eq!(first.as_str(), "!dbg !323");
 
@@ -286,7 +347,7 @@ mod tests {
             assert_eq!(second.as_str(), "!323");
         }
 
-        let second = pairs.next().unwrap();
+        let second = meta_list.next().unwrap();
         assert_eq!(second.as_rule(), Rule::metadata);
         assert_eq!(second.as_str(), "!rust !324");
 
@@ -449,5 +510,31 @@ start: ; comment
     #[test]
     fn type_alias() {
         Ir::parse(Rule::type_alias, r#"%X = type {}"#).unwrap();
+    }
+
+    #[test]
+    fn ty_metadata_number() {
+        Ir::parse(Rule::ty_metadata, "metadata !968").unwrap();
+    }
+
+    #[test]
+    fn ty_metadata_node() {
+        Ir::parse(Rule::ty_metadata, "metadata !DIExpression()").unwrap();
+    }
+
+    #[test]
+    fn call_indirect_meta() {
+        Ir::parse(
+            Rule::instruction,
+            "%1 = tail call i16 %0(i32 3) #3, !dbg !360, !rust_sig !203, !rust_name !361"
+        ).unwrap();
+    }
+
+    #[test]
+    fn call_direct_meta() {
+        Ir::parse(
+            Rule::instruction,
+            "tail call void @__pre_init(), !dbg !261, !rust_sig !262, !rust_name !263"
+        ).unwrap();
     }
 }
