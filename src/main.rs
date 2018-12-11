@@ -95,7 +95,7 @@ fn run() -> Result<i32, failure::Error> {
         _ => {
             return Err(failure::err_msg(
                 "Please specify either --example <NAME> or --bin <NAME>.",
-            ))
+            ));
         }
     }
 
@@ -301,7 +301,7 @@ fn run() -> Result<i32, failure::Error> {
 
                     g.add_edge(caller, callee, ());
                 }
-                Call::Fn { sig }=> {
+                Call::Fn { sig } => {
                     // create a fictitious node for each indirect call
                     let external = g.add_node(Node(sig, Some(0)));
                     // NOTE This node can (should?) be shared as long as the
