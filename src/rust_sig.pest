@@ -1,0 +1,11 @@
+rust_sig = { SOI ~ skip_to_paren ~ "(" ~ fn_args ~ ")" ~ "->" ~ fn_res ~ EOI}
+
+skip_to_paren = { (!"(" ~ ANY)* }
+skip_paren = { "(" ~ (skip_paren | !")" ~ ANY)* ~ ")" }
+
+fn_args = { fn_arg ~ ("," ~ fn_arg)* }
+fn_arg = { ((!"," ~ !"(" ~ !")" ~ ANY) | skip_paren)* }
+
+fn_res = { ANY* }
+
+WHITESPACE = _{ " " }

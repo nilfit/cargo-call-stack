@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use crate::ir::Call;
 
 mod ir;
+mod rust_sig;
 
 fn main() -> Result<(), failure::Error> {
     match run() {
@@ -265,10 +266,22 @@ fn run() -> Result<i32, failure::Error> {
         }
     }
 
+    // maps from cleaned sig strings to indices for fictitious nodes for fn traits
+    let mut fn_trait = HashMap::new();
+
     // add edges
     for define in &defines {
         let caller = if let Some(canonical_name) = aliases.get(&define.name()) {
-            indices[*canonical_name]
+            let caller = indices[*canonical_name];
+            let demangled = rustc_demangle::demangle(&define.name()).to_string();
+            if demangled.starts_with("core::ops::function::Fn") {
+                let sig = rust_sig::clean(define.sig())?;
+                let fictitious = fn_trait
+                    .entry(sig.clone())
+                    .or_insert_with(|| g.add_node(Node(sig, Some(0)))); // FIXME is stack size always 0?
+                g.add_edge(*fictitious, caller, ());
+            }
+            caller
         } else {
             // this symbol was GC-ed by the linker, skip
             continue;
@@ -322,12 +335,12 @@ fn run() -> Result<i32, failure::Error> {
 
                     g.add_edge(caller, external, ());
                 }
-                Call::Trait { name, method, .. } => {
+                Call::Trait { name, method, sig } => {
                     // create a fictitious node for each trait object dispatch
                     let to = format!("dyn {}::{}", name, method);
-
-                    let callee = indices[&*to];
-                    g.add_edge(caller, callee, ());
+                    let sig = rust_sig::clean(sig)?;
+                    let callee = indices.get(&*to).or_else(|| fn_trait.get(&sig)).unwrap();
+                    g.add_edge(caller, *callee, ());
                 }
             }
         }
