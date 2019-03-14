@@ -20,6 +20,7 @@ use petgraph::{
 use std::path::PathBuf;
 
 use crate::ir::Call;
+use crate::rust_sig::{ClosureTrait, ClosureSig};
 
 mod ir;
 mod rust_sig;
@@ -271,16 +272,19 @@ fn run() -> Result<i32, failure::Error> {
 
     // add edges
     for define in &defines {
+        // FIXME this canonical_name thing feels like it should be a filter_map 
         let caller = if let Some(canonical_name) = aliases.get(&define.name()) {
             let caller = indices[*canonical_name];
-            let demangled = rustc_demangle::demangle(&define.name()).to_string();
-            if demangled.starts_with("core::ops::function::Fn") {
-                let sig = rust_sig::clean(define.sig())?;
-                let fictitious = fn_trait
-                    .entry(sig.clone())
-                    .or_insert_with(|| g.add_node(Node(sig, Some(0)))); // FIXME is stack size always 0?
-                g.add_edge(*fictitious, caller, ());
-            }
+            //let demangled = rustc_demangle::demangle(&define.name()).to_string();
+            //let closure_trait = ClosureTrait::from_string(&demangled);
+            //if demangled.starts_with("core::ops::function::Fn") {
+            //    eprintln!("found a define {}", demangled);
+            //    let sig = rust_sig::clean(define.sig())?;
+            //    let fictitious = fn_trait
+            //        .entry((sig.clone(), closure_trait))
+            //        .or_insert_with(|| g.add_node(Node((sig, closure_trait), Some(0)))); // FIXME is stack size always 0?
+            //    g.add_edge(*fictitious, caller, ());
+            //}
             caller
         } else {
             // this symbol was GC-ed by the linker, skip
@@ -338,11 +342,33 @@ fn run() -> Result<i32, failure::Error> {
                 Call::Trait { name, method, sig } => {
                     // create a fictitious node for each trait object dispatch
                     let to = format!("dyn {}::{}", name, method);
-                    let sig = rust_sig::clean(sig)?;
-                    let callee = indices.get(&*to).or_else(|| fn_trait.get(&sig)).unwrap();
-                    g.add_edge(caller, *callee, ());
+                    eprintln!("{}", to);
+                    let ClosureSig { sig, closure_trait } = rust_sig::clean_callsite(sig)?;
+                    //let callee = indices.get(&*to).or_else(|| fn_trait.get(&sig)).unwrap();
+                    // re-use or create a fictitious node that will be connected to all
+                    // implementers later
+                    let fictitious_callee =
+                        indices.get(&*to)
+                        //.or_else(|| fn_trait.get(&sig)).unwrap();
+                        .unwrap_or_else(|| fn_trait.entry(sig.clone()).or_insert_with(|| g.add_node(Node(sig, Some(0)))));
+                    // FIXME is stack size always 0?
+                    g.add_edge(caller, *fictitious_callee, ());
                 }
             }
+        }
+    }
+
+    // add edges from fictitious Fn nodes to all impls
+    for define in &defines {
+        //for (sig, node) in fn_trait { // no
+
+        let demangled = rustc_demangle::demangle(&define.name()).to_string();
+        let closure_trait = ClosureTrait::from_string(&demangled);
+        //if demangled.starts_with("core::ops::function::Fn") {
+        //let sig = rust_sig::clean(define.sig())?;
+        let csig = ClosureSig::new(&define.sig(), &demangled)?;
+        if let Some(fictitious) = fn_trait.get(&csig) {
+
         }
     }
 

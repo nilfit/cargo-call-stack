@@ -1,11 +1,26 @@
 rust_sig = { SOI ~ skip_to_paren ~ "(" ~ fn_args ~ ")" ~ "->" ~ fn_res ~ EOI}
 
+lifetime_for = { "for" ~ skip_bracket_ltgt }
+closure_trait_arg1 = {
+  "&"? ~ "mut"? ~ "dyn" ~ lifetime_for? ~ closure_trait ~ skip_paren ~
+  "->" ~ fn_res
+}
+// fn is last because it is a prefix of the others
+closure_trait = { trait_fnonce | trait_fnmut | trait_fn }
+trait_fn = { "core::ops::Fn" }
+trait_fnmut = { "core::ops::FnMut" }
+trait_fnonce = { "core::ops::FnOnce" }
+
 skip_to_paren = { (!"(" ~ ANY)* }
 skip_paren = { "(" ~ (skip_paren | !")" ~ ANY)* ~ ")" }
+skip_bracket_ltgt = { "<" ~ (skip_bracket_ltgt | !">" ~ ANY)* ~ ">" }
 
 fn_args = { fn_arg ~ ("," ~ fn_arg)* }
-fn_arg = { ((!"," ~ !"(" ~ !")" ~ ANY) | skip_paren)* }
+//fn_arg = { closure_trait_arg1 | ((!"," ~ !"(" ~ !")" ~ ANY))* }
+fn_arg = { closure_trait_arg1 | (not_paren_or_comma | skip_paren)* }
 
-fn_res = { ANY* }
+//fn_res = { ANY* }
+fn_res = { ( not_paren_or_comma | skip_paren)* }
+not_paren_or_comma = { !"," ~ !"(" ~ !")" ~ ANY }
 
 WHITESPACE = _{ " " }

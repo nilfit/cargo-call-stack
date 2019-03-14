@@ -419,7 +419,7 @@ start: ; comment
             .unwrap();
     }
 
-    #[test]
+    #[test] #[ignore]
     fn files() -> Result<(), failure::Error> {
         for e in fs::read_dir("tests")? {
             let p = e?.path();
